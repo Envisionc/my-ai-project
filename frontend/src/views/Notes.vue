@@ -124,7 +124,7 @@ onMounted(fetchNotes)
 
 <style scoped>
 .notes-container {
-  height: 100vh;
+  height: 100%;
 }
 .notes-header {
   background: #fff;
@@ -181,7 +181,7 @@ onMounted(fetchNotes)
 .note-card:hover {
   transform: translateY(-2px);
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.08);
-  border-color: #409eff;
+  border-color: #ff630f;
 }
 .note-card-header {
   display: flex;

@@ -47,11 +47,69 @@ db.serialize(() => {
   db.run(`CREATE TABLE IF NOT EXISTS conversations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER,
+    session_id INTEGER,
     question TEXT NOT NULL,
     answer TEXT NOT NULL,
     created_at DATETIME DEFAULT (datetime('now', 'localtime')),
     FOREIGN KEY (user_id) REFERENCES users(id)
   )`);
+
+  // 兼容旧数据库：为 conversations 表补充 user_id 列
+  db.run(`ALTER TABLE conversations ADD COLUMN user_id INTEGER REFERENCES users(id)`, (err) => {
+    if (err && !err.message.includes('duplicate column')) {
+      console.error('迁移 user_id 列失败:', err.message);
+    }
+    // 将旧记录（user_id 为 NULL）关联到默认用户
+    db.run(`UPDATE conversations SET user_id = (SELECT id FROM users ORDER BY id LIMIT 1) WHERE user_id IS NULL`);
+  });
+
+  // 创建 sessions 表
+  db.run(`CREATE TABLE IF NOT EXISTS sessions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    title TEXT NOT NULL DEFAULT '新对话',
+    is_pinned INTEGER NOT NULL DEFAULT 0,
+    created_at DATETIME DEFAULT (datetime('now', 'localtime')),
+    FOREIGN KEY (user_id) REFERENCES users(id)
+  )`);
+
+  // 兼容旧数据库：补充 is_pinned 列
+  db.run(`ALTER TABLE sessions ADD COLUMN is_pinned INTEGER NOT NULL DEFAULT 0`, (err) => {
+    if (err && !err.message.includes('duplicate column')) {
+      console.error('迁移 is_pinned 列失败:', err.message);
+    }
+  });
+
+  // 兼容旧数据库：为 conversations 补充 session_id 列
+  db.run(`ALTER TABLE conversations ADD COLUMN session_id INTEGER`, (err) => {
+    if (err && !err.message.includes('duplicate column')) {
+      console.error('迁移 session_id 列失败:', err.message);
+      return;
+    }
+    // 为每个有对话但没有会话的用户创建会话
+    db.run(`
+      INSERT INTO sessions (user_id, title, created_at)
+        SELECT c.user_id, '历史对话', MIN(c.created_at)
+        FROM conversations c
+        WHERE c.session_id IS NULL
+        GROUP BY c.user_id
+    `, function(insertErr) {
+      if (insertErr) {
+        console.error('创建默认会话失败:', insertErr.message);
+        return;
+      }
+      if (this.changes === 0) return;
+      // 按 user_id 匹配更新
+      db.all(`SELECT id, user_id FROM sessions WHERE user_id IN (
+        SELECT DISTINCT user_id FROM conversations WHERE session_id IS NULL
+      )`, (e2, sessions) => {
+        if (e2) { console.error(e2.message); return; }
+        sessions.forEach(s => {
+          db.run('UPDATE conversations SET session_id = ? WHERE user_id = ? AND session_id IS NULL', [s.id, s.user_id]);
+        });
+      });
+    });
+  });
 });
 
 // ============ JWT 认证中间件 ============
@@ -254,10 +312,10 @@ app.delete('/api/notes/:id', authMiddleware, (req, res) => {
 
 // ============ AI 问答接口（带用户关联）============
 
-// POST /api/chat - 调用 DeepSeek API
+// POST /api/chat - 调用 DeepSeek API（支持 session_id）
 app.post('/api/chat', authMiddleware, async (req, res) => {
   try {
-    const { question } = req.body;
+    const { question, session_id } = req.body;
     if (!question) {
       return res.json({ success: false, data: null, message: '请输入问题' });
     }
@@ -282,10 +340,10 @@ app.post('/api/chat', authMiddleware, async (req, res) => {
 
     const answer = response.data.choices[0].message.content;
 
-    // 存入数据库（关联用户）
+    // 存入数据库（关联用户和会话）
     db.run(
-      'INSERT INTO conversations (user_id, question, answer) VALUES (?, ?, ?)',
-      [req.userId, question, answer],
+      'INSERT INTO conversations (user_id, session_id, question, answer) VALUES (?, ?, ?, ?)',
+      [req.userId, session_id || null, question, answer],
       function (err) {
         if (err) {
           console.error('数据库写入失败:', err.message);
@@ -300,15 +358,97 @@ app.post('/api/chat', authMiddleware, async (req, res) => {
   }
 });
 
-// GET /api/history - 获取当前用户的历史记录
-app.get('/api/history', authMiddleware, (req, res) => {
+// ============ 会话管理接口 ============
+
+// POST /api/sessions - 创建新会话
+app.post('/api/sessions', authMiddleware, (req, res) => {
+  db.run(
+    'INSERT INTO sessions (user_id, title) VALUES (?, ?)',
+    [req.userId, '新对话'],
+    function (err) {
+      if (err) {
+        console.error('创建会话失败:', err.message);
+        return res.json({ success: false, data: null, message: '创建会话失败' });
+      }
+      res.json({ success: true, data: { id: this.lastID, title: '新对话' }, message: '' });
+    }
+  );
+});
+
+// GET /api/sessions - 获取当前用户的会话列表
+app.get('/api/sessions', authMiddleware, (req, res) => {
+  db.all(`
+    SELECT s.id, s.title, s.is_pinned, s.created_at,
+      COUNT(c.id) as msg_count,
+      (SELECT question FROM conversations WHERE session_id = s.id ORDER BY id ASC LIMIT 1) as first_question
+    FROM sessions s
+    LEFT JOIN conversations c ON c.session_id = s.id
+    WHERE s.user_id = ?
+    GROUP BY s.id
+    ORDER BY s.is_pinned DESC, s.created_at DESC
+  `, [req.userId], (err, rows) => {
+    if (err) {
+      console.error('查询会话列表失败:', err.message);
+      return res.json({ success: false, data: null, message: '获取会话列表失败' });
+    }
+    res.json({ success: true, data: rows, message: '' });
+  });
+});
+
+// DELETE /api/sessions/:id - 删除会话及其消息
+app.delete('/api/sessions/:id', authMiddleware, (req, res) => {
+  const sessionId = req.params.id;
+  // 先删消息，再删会话
+  db.run('DELETE FROM conversations WHERE session_id = ? AND user_id = ?', [sessionId, req.userId], () => {
+    db.run('DELETE FROM sessions WHERE id = ? AND user_id = ?', [sessionId, req.userId], function (err) {
+      if (err) {
+        console.error('删除会话失败:', err.message);
+        return res.json({ success: false, data: null, message: '删除会话失败' });
+      }
+      if (this.changes === 0) {
+        return res.json({ success: false, data: null, message: '会话不存在或无权操作' });
+      }
+      res.json({ success: true, data: null, message: '删除成功' });
+    });
+  });
+});
+
+// PUT /api/sessions/:id - 更新会话（重命名 / 置顶）
+app.put('/api/sessions/:id', authMiddleware, (req, res) => {
+  const { title, is_pinned } = req.body;
+  const updates = [];
+  const params = [];
+  if (title !== undefined) { updates.push('title = ?'); params.push(title); }
+  if (is_pinned !== undefined) { updates.push('is_pinned = ?'); params.push(is_pinned ? 1 : 0); }
+  if (updates.length === 0) {
+    return res.json({ success: false, data: null, message: '没有要更新的字段' });
+  }
+  params.push(req.params.id, req.userId);
+  db.run(
+    `UPDATE sessions SET ${updates.join(', ')} WHERE id = ? AND user_id = ?`,
+    params,
+    function (err) {
+      if (err) {
+        console.error('更新会话失败:', err.message);
+        return res.json({ success: false, data: null, message: '更新会话失败' });
+      }
+      if (this.changes === 0) {
+        return res.json({ success: false, data: null, message: '会话不存在或无权操作' });
+      }
+      res.json({ success: true, data: null, message: '更新成功' });
+    }
+  );
+});
+
+// GET /api/sessions/:id/messages - 获取某会话的所有消息
+app.get('/api/sessions/:id/messages', authMiddleware, (req, res) => {
   db.all(
-    'SELECT id, question, answer, created_at FROM conversations WHERE user_id = ? ORDER BY created_at DESC',
-    [req.userId],
+    'SELECT id, question, answer, created_at FROM conversations WHERE session_id = ? AND user_id = ? ORDER BY id ASC',
+    [req.params.id, req.userId],
     (err, rows) => {
       if (err) {
-        console.error('数据库查询失败:', err.message);
-        return res.json({ success: false, data: null, message: '获取历史记录失败' });
+        console.error('查询消息失败:', err.message);
+        return res.json({ success: false, data: null, message: '获取消息失败' });
       }
       res.json({ success: true, data: rows, message: '' });
     }

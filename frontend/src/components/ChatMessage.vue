@@ -4,7 +4,7 @@
       <el-avatar :icon="role === 'user' ? UserFilled : Promotion" :size="36" />
     </div>
     <div class="message-bubble">
-      <div class="message-content">{{ content }}</div>
+      <div class="message-content" style="white-space: pre-wrap">{{ content }}</div>
       <div class="message-time">{{ time }}</div>
     </div>
   </div>
@@ -52,7 +52,7 @@ defineProps({
   position: relative;
 }
 .is-user .message-bubble {
-  background: #409eff;
+  background: #ff630f;
   color: #fff;
   border-bottom-right-radius: 4px;
 }

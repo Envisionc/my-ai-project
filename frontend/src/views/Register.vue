@@ -164,7 +164,7 @@ async function handleRegister() {
   color: #999;
 }
 .register-footer a {
-  color: #409eff;
+  color: #ff630f;
   text-decoration: none;
 }
 .register-footer a:hover {

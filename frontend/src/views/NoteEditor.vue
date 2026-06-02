@@ -114,7 +114,7 @@ onMounted(fetchNote)
 
 <style scoped>
 .editor-container {
-  height: 100vh;
+  height: 100%;
 }
 .editor-header {
   background: #fff;

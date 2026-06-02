@@ -2,10 +2,14 @@
   <el-container direction="vertical" class="chat-container">
     <el-header class="chat-header">
       <h2>
-        <el-icon><ChatDotSquare /></el-icon>
+        <el-icon><Message /></el-icon>
         AI 问答助手
       </h2>
       <div class="header-actions">
+        <el-button type="primary" size="small" @click="createSession">
+          <el-icon><Plus /></el-icon>
+          新对话
+        </el-button>
         <el-button text @click="showHistory = !showHistory">
           <el-icon><Timer /></el-icon>
           {{ showHistory ? '隐藏历史' : '历史记录' }}
@@ -20,7 +24,14 @@
     <el-container class="chat-body">
       <!-- 历史记录侧边栏 -->
       <el-aside v-if="showHistory" width="280px" class="history-sidebar">
-        <HistoryPanel :list="historyList" @select="handleSelect" />
+        <HistoryPanel
+          :list="sessions"
+          :active-id="currentSessionId"
+          @select="handleSelect"
+          @rename="handleRenameSession"
+          @pin="handlePinSession"
+          @delete="handleDeleteSession"
+        />
       </el-aside>
 
       <!-- 主聊天区 -->
@@ -44,9 +55,10 @@
 </template>
 
 <script setup>
-import { ref, onMounted, nextTick } from 'vue'
+import { ref, watch, onMounted, nextTick } from 'vue'
 import axios from 'axios'
 import { getToken } from '../utils/auth'
+import { ElMessageBox } from 'element-plus'
 import ChatMessage from '../components/ChatMessage.vue'
 import ChatInput from '../components/ChatInput.vue'
 import HistoryPanel from '../components/HistoryPanel.vue'
@@ -54,26 +66,125 @@ import HistoryPanel from '../components/HistoryPanel.vue'
 const API_BASE = ''
 
 const messages = ref([])
-const historyList = ref([])
+const sessions = ref([])
+const currentSessionId = ref(null)
 const loading = ref(false)
 const chatAreaRef = ref(null)
 const showHistory = ref(true)
+const skipAutoScroll = ref(false)
 
 function authHeader() {
   return { Authorization: `Bearer ${getToken()}` }
 }
 
-async function fetchHistory() {
+/** 获取会话列表 */
+async function fetchSessions() {
   try {
-    const res = await axios.get(`${API_BASE}/api/history`, { headers: authHeader() })
+    const res = await axios.get(`${API_BASE}/api/sessions`, { headers: authHeader() })
     if (res.data.success) {
-      historyList.value = res.data.data
+      sessions.value = res.data.data
     }
   } catch (e) {
-    console.error('获取历史记录失败', e)
+    console.error('获取会话列表失败', e)
   }
 }
 
+/** 加载指定会话的消息 */
+async function loadSessionMessages(sessionId) {
+  try {
+    const res = await axios.get(`${API_BASE}/api/sessions/${sessionId}/messages`, {
+      headers: authHeader(),
+    })
+    if (res.data.success) {
+      const items = res.data.data || []
+      messages.value = items.flatMap((m) => [
+        { role: 'user', content: m.question, time: m.created_at },
+        { role: 'ai', content: m.answer, time: m.created_at },
+      ])
+      currentSessionId.value = sessionId
+      scrollToBottom()
+    }
+  } catch (e) {
+    console.error('加载会话消息失败', e)
+  }
+}
+
+/** 创建新会话 */
+async function createSession() {
+  try {
+    const res = await axios.post(`${API_BASE}/api/sessions`, {}, { headers: authHeader() })
+    if (res.data.success) {
+      currentSessionId.value = res.data.data.id
+      messages.value = []
+      await fetchSessions()
+    }
+  } catch (e) {
+    console.error('创建会话失败', e)
+  }
+}
+
+/** 删除会话 */
+async function handleDeleteSession(sessionId) {
+  try {
+    const res = await axios.delete(`${API_BASE}/api/sessions/${sessionId}`, {
+      headers: authHeader(),
+    })
+    if (res.data.success) {
+      // 如果删除的是当前会话，清空聊天区或切换到其他会话
+      if (currentSessionId.value === sessionId) {
+        const other = sessions.value.find((s) => s.id !== sessionId)
+        if (other) {
+          await loadSessionMessages(other.id)
+        } else {
+          messages.value = []
+          currentSessionId.value = null
+        }
+      }
+      await fetchSessions()
+    }
+  } catch (e) {
+    console.error('删除会话失败', e)
+  }
+}
+
+/** 选择会话 */
+async function handleSelect(sessionId) {
+  if (sessionId === currentSessionId.value) return
+  skipAutoScroll.value = true
+  await loadSessionMessages(sessionId)
+}
+
+/** 重命名会话 */
+async function handleRenameSession(sessionId) {
+  const session = sessions.value.find((s) => s.id === sessionId)
+  const { value: newTitle } = await ElMessageBox.prompt('请输入新名称', '重命名会话', {
+    inputValue: session?.title || '',
+    confirmButtonText: '确定',
+    cancelButtonText: '取消',
+  })
+  if (newTitle) {
+    await axios.put(
+      `${API_BASE}/api/sessions/${sessionId}`,
+      { title: newTitle },
+      { headers: authHeader() }
+    )
+    await fetchSessions()
+  }
+}
+
+/** 置顶 / 取消置顶 */
+async function handlePinSession(sessionId) {
+  const session = sessions.value.find((s) => s.id === sessionId)
+  if (!session) return
+  await axios.put(
+    `${API_BASE}/api/sessions/${sessionId}`,
+    { is_pinned: session.is_pinned ? 0 : 1 },
+    { headers: authHeader() }
+  )
+  await fetchSessions()
+}
+
+/** 发送消息 */
 async function handleSend(question) {
   const now = new Date().toLocaleString()
   messages.value.push({ role: 'user', content: question, time: now })
@@ -82,7 +193,7 @@ async function handleSend(question) {
   try {
     const res = await axios.post(
       `${API_BASE}/api/chat`,
-      { question },
+      { question, session_id: currentSessionId.value },
       { headers: authHeader() }
     )
     if (res.data.success) {
@@ -91,7 +202,7 @@ async function handleSend(question) {
         content: res.data.data.answer,
         time: new Date().toLocaleString(),
       })
-      await fetchHistory()
+      await fetchSessions()
     } else {
       messages.value.push({
         role: 'ai',
@@ -111,13 +222,6 @@ async function handleSend(question) {
   }
 }
 
-function handleSelect(item) {
-  messages.value = [
-    { role: 'user', content: item.question, time: item.created_at },
-    { role: 'ai', content: item.answer, time: item.created_at },
-  ]
-}
-
 function clearChat() {
   messages.value = []
 }
@@ -129,14 +233,30 @@ function scrollToBottom() {
   })
 }
 
-onMounted(() => {
-  fetchHistory()
+// 监听 messages 变化，自动滚动到底部
+watch(messages, () => {
+  if (skipAutoScroll.value) {
+    skipAutoScroll.value = false
+    return
+  }
+  scrollToBottom()
+}, { deep: false })
+
+onMounted(async () => {
+  await fetchSessions()
+  // 自动加载最近一个会话
+  if (sessions.value.length > 0) {
+    await loadSessionMessages(sessions.value[0].id)
+  } else {
+    // 没有会话则创建一个
+    await createSession()
+  }
 })
 </script>
 
 <style scoped>
 .chat-container {
-  height: 100vh;
+  height: 100%;
 }
 .chat-header {
   background: #fff;
@@ -160,7 +280,7 @@ onMounted(() => {
   gap: 8px;
 }
 .chat-body {
-  height: calc(100vh - 60px - 130px);
+  height: calc(100% - 60px - 130px);
   overflow: hidden;
 }
 .history-sidebar {

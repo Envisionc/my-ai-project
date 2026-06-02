@@ -134,7 +134,7 @@ async function handleLogin() {
   color: #999;
 }
 .login-footer a {
-  color: #409eff;
+  color: #ff630f;
   text-decoration: none;
 }
 .login-footer a:hover {
